@@ -13,6 +13,12 @@ GlobalFlags = {"keep_accepting": True, "keep_reading": True, "keep_delivering": 
 GlobalVariables = {}
 HoldbackQueues = {}
 Semaphores = {}
+KeyValueStore = {}
+Leader = ""
+TO_Holdback = {}
+Sequencer = 1
+sockets = {}
+Name = ""
 
 class message:
 	def __init__(self):
@@ -20,6 +26,7 @@ class message:
 		self.sender = ""
 		self.delay = 0.0
 		self.time = 0.0
+		self.seq = -1
 
 
 
@@ -31,13 +38,15 @@ def serverInit(port):
 
 def main(argv):
 	print "starting"
+	Name = argv[2]
 	f = open(argv[1], 'r')
-	sockets = dict()
 	for line in f:
 		l = line.split()
+		if "L" in l:
+			Leader = l[0]
 		if l[0] == "delay":
 			GlobalVariables["delay"] = l[1]
-		elif l[0] == argv[2]:
+		elif l[0] == Name:
 			p = serverInit(int(l[1]))
 		sockets[l[0]] = int(l[1])
 		HoldbackQueues[l[0]] = Queue.Queue()
@@ -71,7 +80,7 @@ def main(argv):
 			GlobalFlags["keep_delivering"] = False
 			#unhook accept thread
 			s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-			s.connect((TCP_IP, sockets[argv[2]]))
+			s.connect((TCP_IP, sockets[Name]))
 			s.close()
 			#unhook deliver thread
 			Semaphores["s1"].release()
@@ -80,15 +89,14 @@ def main(argv):
 			Semaphores["s4"].release()
 		elif c[0] in ValidCommands:
 			if c[0] == "send":
-				mp1_send(sockets[c[1]], c[2], GlobalVariables["delay"], argv[2])
-			elif c[0] == "delete":
-				pass
-			elif c[0] == "get":
-				pass
-			elif c[0] == "insert":
-				pass
-			elif c[0] == "update":
-				pass
+				mp1_send(sockets[c[1]], c[2], GlobalVariables["delay"], Name, -1)
+			else:
+				if len(c) >= 3: #check to see if the model matters
+					if c[-1] in [1,2]: #check to see if the consistency model is one of the first two
+						mp1_send(sockets[Leader], command, GlobalVariables["delay"], Name, 0)
+				else:
+					for i in range(3):
+						mp1_send(sockets[i], command, GlobalVariables["delay"], Name, -1)
 		else:
 			print "invalid command, try again"
 	acc.join()
@@ -102,13 +110,13 @@ def main(argv):
 	hq4.join()
 	print "hq4 closed"
 
-
-def mp1_send(serverport, mesg, max_delay, sndr):
+def mp1_send(serverport, mesg, max_delay, sndr, sequence):
 	m = message()
 	m.message = mesg
 	m.delay = random.uniform(0, int(max_delay))
 	m.sender = sndr
 	m.time = time.time()
+	m.seq = sequence
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	s.connect((TCP_IP, serverport))
 	m_pickled = pickle.dumps(m)
@@ -148,13 +156,31 @@ def deliverHandler(sender):
 			print "message received"
 			systime = time.time()
 			if mesg_object.time+mesg_object.delay < systime:
-				print str(mesg_object.time+mesg_object.delay)+"is greater than "+str(systime)+": delivering message...\n"+mesg_object.message
+				pass
 			else:
 				time.sleep(mesg_object.time+mesg_object.delay-systime)
-				print mesg_object.message
+			commandHandler(mesg_object)
 		except Queue.Empty:
 			pass
 
+def commandHandler(mesg_object):
+	c = mesg_object.message.split()
+	if c[0] == "delete":
+		del KeyValueStore[c[1]]
+	elif c[0] in ["get", "insert", "update"]:
+		if c[2] in [1, 2]:
+			#Total ordering necessary, need to know if leader
+			if mesg_object.seq == 0:
+				mesg_object.seq = Sequencer
+				Sequencer += 1
+				for i in range(3):
+					mp1_send(sockets[i], mesg_object.message, mesg_object.delay, Name, mesg_object.seq)
+			else:
+				TO_Holdback[mesg_object.seq] = mesg_object
+
+	else:
+		pass
+		#Do Nothing
 
 if __name__ == "__main__":
 	main(sys.argv)
