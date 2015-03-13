@@ -16,9 +16,11 @@ Semaphores = {}
 KeyValueStore = {}
 Leader = ""
 TO_Holdback = {}
-Sequencer = 1
+Sequencer_R = 1
+Sequencer_S = 1
 sockets = {}
 Name = ""
+HoldbackSem = threading.Semaphore(0)
 
 class message:
 	def __init__(self):
@@ -38,6 +40,7 @@ def serverInit(port):
 
 def main(argv):
 	print "starting"
+	model = 0
 	Name = argv[2]
 	f = open(argv[1], 'r')
 	for line in f:
@@ -92,6 +95,10 @@ def main(argv):
 				mp1_send(sockets[c[1]], c[2], GlobalVariables["delay"], Name, -1)
 			else:
 				if len(c) >= 3: #check to see if the model matters
+					if model == 0:
+						model = c[-1]
+						comm = threading.Thread(target=commandHandler, args=(model,))
+						comm.start()
 					if c[-1] in [1,2]: #check to see if the consistency model is one of the first two
 						mp1_send(sockets[Leader], command, GlobalVariables["delay"], Name, 0)
 				else:
@@ -109,6 +116,7 @@ def main(argv):
 	print "hq3 closed"
 	hq4.join()
 	print "hq4 closed"
+	comm.join()
 
 def mp1_send(serverport, mesg, max_delay, sndr, sequence):
 	m = message()
@@ -159,11 +167,11 @@ def deliverHandler(sender):
 				pass
 			else:
 				time.sleep(mesg_object.time+mesg_object.delay-systime)
-			commandHandler(mesg_object)
+			modelHandler(mesg_object)
 		except Queue.Empty:
 			pass
 
-def commandHandler(mesg_object):
+def modelHandler(mesg_object):
 	c = mesg_object.message.split()
 	if c[0] == "delete":
 		del KeyValueStore[c[1]]
@@ -171,16 +179,40 @@ def commandHandler(mesg_object):
 		if c[2] in [1, 2]:
 			#Total ordering necessary, need to know if leader
 			if mesg_object.seq == 0:
-				mesg_object.seq = Sequencer
-				Sequencer += 1
+				mesg_object.seq = Sequencer_S
+				Sequencer_S += 1
 				for i in range(3):
 					mp1_send(sockets[i], mesg_object.message, mesg_object.delay, Name, mesg_object.seq)
 			else:
 				TO_Holdback[mesg_object.seq] = mesg_object
+				HoldbackSem.release()
 
 	else:
 		pass
 		#Do Nothing
+
+def commandHandler(model):
+	if model == 1:
+		while GlobalFlags["keep_delivering"]:
+			if Sequencer_R in TO_Holdback:
+				mesg = TO_Holdback[Sequencer]
+				del TO_Holdback[Sequencer]
+				Sequencer_R += 1
+				c = mesg.message.split()
+				if c[0] == "get":
+					if mesg.sender == Name:
+						print KeyValueStore[c[1]]
+				elif c[0] in ["insert", "update"]:
+					KeyValueStore[c[1]] = c[2]
+					if mesg.sender == Name:
+						print "ack"
+			else:
+				HoldbackSem.acquire()
+	if model == 2:
+
+
+
+
 
 if __name__ == "__main__":
 	main(sys.argv)
