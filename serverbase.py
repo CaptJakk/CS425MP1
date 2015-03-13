@@ -81,6 +81,14 @@ def main(argv):
 		elif c[0] in ValidCommands:
 			if c[0] == "send":
 				mp1_send(sockets[c[1]], c[2], GlobalVariables["delay"], argv[2])
+			elif c[0] == "delete":
+				pass
+			elif c[0] == "get":
+				pass
+			elif c[0] == "insert":
+				pass
+			elif c[0] == "update":
+				pass
 		else:
 			print "invalid command, try again"
 	acc.join()
