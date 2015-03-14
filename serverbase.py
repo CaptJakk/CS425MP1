@@ -10,14 +10,12 @@ import Queue
 TCP_IP = "127.0.0.1"
 ValidCommands = ["send","insert", "delete", "get", "update", "delay", "search", "show-all"]
 GlobalFlags = {"keep_accepting": True, "keep_reading": True, "keep_delivering": True}
-GlobalVariables = {}
+GlobalVariables = {"Sequencer_R":1, "Sequencer_S":1}
 HoldbackQueues = {}
 Semaphores = {}
 KeyValueStore = {}
 Leader = ""
 TO_Holdback = {}
-Sequencer_R = 1
-Sequencer_S = 1
 sockets = {}
 Name = ""
 HoldbackSem = threading.Semaphore(0)
@@ -26,6 +24,7 @@ class message:
 	def __init__(self):
 		self.message = ""
 		self.sender = ""
+		self.origin = ""
 		self.delay = 0.0
 		self.time = 0.0
 		self.seq = -1
@@ -39,8 +38,8 @@ def serverInit(port):
 	return s
 
 def main(argv):
-	print "starting"
 	model = 0
+	global Name
 	Name = argv[2]
 	f = open(argv[1], 'r')
 	for line in f:
@@ -90,39 +89,37 @@ def main(argv):
 			Semaphores["s2"].release()
 			Semaphores["s3"].release()
 			Semaphores["s4"].release()
+			HoldbackSem.release()
 		elif c[0] in ValidCommands:
 			if c[0] == "send":
-				mp1_send(sockets[c[1]], c[2], GlobalVariables["delay"], Name, -1)
+				mp1_send(sockets[c[1]], c[2], GlobalVariables["delay"], Name, Name, -1)
 			else:
 				if len(c) >= 3: #check to see if the model matters
 					if model == 0:
-						model = c[-1]
+						model = int(c[-1])
 						comm = threading.Thread(target=commandHandler, args=(model,))
 						comm.start()
-					if c[-1] in [1,2]: #check to see if the consistency model is one of the first two
-						mp1_send(sockets[Leader], command, GlobalVariables["delay"], Name, 0)
+					if int(c[-1]) in [1,2]: #check to see if the consistency model is one of the first two
+						mp1_send(sockets[Leader], command, GlobalVariables["delay"], Name, Name, 0)
 				else:
-					for i in range(3):
-						mp1_send(sockets[i], command, GlobalVariables["delay"], Name, -1)
+					for i in range(4):
+						mp1_send(sockets["s"+str(i+1)], command, GlobalVariables["delay"], Name, Name, -1)
 		else:
 			print "invalid command, try again"
 	acc.join()
-	print "accept closed"
 	hq1.join()
-	print "hq1 closed"
 	hq2.join()
-	print "hq2 closed"
 	hq3.join()
-	print "hq3 closed"
 	hq4.join()
-	print "hq4 closed"
-	comm.join()
+	if model != 0:
+		comm.join()
 
-def mp1_send(serverport, mesg, max_delay, sndr, sequence):
+def mp1_send(serverport, mesg, max_delay, sndr, orig, sequence):
 	m = message()
 	m.message = mesg
 	m.delay = random.uniform(0, int(max_delay))
 	m.sender = sndr
+	m.origin = orig
 	m.time = time.time()
 	m.seq = sequence
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -153,7 +150,6 @@ def receiveHandler(conn, addr):
 		return
 	mesg_object = pickle.loads(req)
 	HoldbackQueues[mesg_object.sender].put(mesg_object)
-	print "pushed message"
 	Semaphores[mesg_object.sender].release()
 
 def deliverHandler(sender):
@@ -161,7 +157,6 @@ def deliverHandler(sender):
 		Semaphores[sender].acquire()
 		try:
 			mesg_object = HoldbackQueues[sender].get(False)
-			print "message received"
 			systime = time.time()
 			if mesg_object.time+mesg_object.delay < systime:
 				pass
@@ -176,13 +171,13 @@ def modelHandler(mesg_object):
 	if c[0] == "delete":
 		del KeyValueStore[c[1]]
 	elif c[0] in ["get", "insert", "update"]:
-		if c[2] in [1, 2]:
+		if int(c[-1]) in [1, 2]:
 			#Total ordering necessary, need to know if leader
 			if mesg_object.seq == 0:
-				mesg_object.seq = Sequencer_S
-				Sequencer_S += 1
-				for i in range(3):
-					mp1_send(sockets[i], mesg_object.message, mesg_object.delay, Name, mesg_object.seq)
+				mesg_object.seq = GlobalVariables["Sequencer_S"]
+				GlobalVariables["Sequencer_S"] += 1
+				for i in range(4):
+					mp1_send(sockets["s"+str(i+1)], mesg_object.message, GlobalVariables["delay"], Name, mesg_object.origin, mesg_object.seq)
 			else:
 				TO_Holdback[mesg_object.seq] = mesg_object
 				HoldbackSem.release()
@@ -192,23 +187,25 @@ def modelHandler(mesg_object):
 		#Do Nothing
 
 def commandHandler(model):
+	print type(model)
 	if model == 1:
 		while GlobalFlags["keep_delivering"]:
-			if Sequencer_R in TO_Holdback:
-				mesg = TO_Holdback[Sequencer]
-				del TO_Holdback[Sequencer]
-				Sequencer_R += 1
+			if GlobalVariables["Sequencer_R"] in TO_Holdback:
+				mesg = TO_Holdback[GlobalVariables["Sequencer_R"]]
+				del TO_Holdback[GlobalVariables["Sequencer_R"]]
+				GlobalVariables["Sequencer_R"] += 1
 				c = mesg.message.split()
 				if c[0] == "get":
-					if mesg.sender == Name:
+					if mesg.origin == Name:
 						print KeyValueStore[c[1]]
 				elif c[0] in ["insert", "update"]:
 					KeyValueStore[c[1]] = c[2]
-					if mesg.sender == Name:
+					if mesg.origin == Name:
 						print "ack"
 			else:
 				HoldbackSem.acquire()
 	if model == 2:
+		pass
 
 
 
