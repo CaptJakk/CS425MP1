@@ -19,6 +19,8 @@ TO_Holdback = {}
 sockets = {}
 Name = ""
 HoldbackSem = threading.Semaphore(0)
+AckSem = threading.Semaphore(0)
+EventualQueue = Queue.Queue()
 
 class message:
 	def __init__(self):
@@ -72,7 +74,10 @@ def main(argv):
 
 
 	while GlobalFlags["keep_reading"]:
-		command = raw_input("please enter new command:")
+		try:
+			command = raw_input("please enter new command:")
+		except EOFError:
+			command = "exit"
 		c = command.split()
 		if command == "":
 			continue
@@ -90,17 +95,43 @@ def main(argv):
 			Semaphores["s3"].release()
 			Semaphores["s4"].release()
 			HoldbackSem.release()
+			EventualQueue.put("exit")
 		elif c[0] in ValidCommands:
 			if c[0] == "send":
 				mp1_send(sockets[c[1]], c[2], GlobalVariables["delay"], Name, Name, -1)
+			if c[0] == "delay":
+				time.sleep(float(c[1]))
+			if c[0] == "show-all":
+				print KeyValueStore
+			if c[0] == "search":
+				for i in range(4):
+					mp1_send(sockets["s"+str(i+1)], command, GlobalVariables["delay"], Name, Name, -1)
 			else:
 				if len(c) >= 3: #check to see if the model matters
 					if model == 0:
 						model = int(c[-1])
 						comm = threading.Thread(target=commandHandler, args=(model,))
 						comm.start()
-					if int(c[-1]) in [1,2]: #check to see if the consistency model is one of the first two
+					if int(c[-1]) == 1: #check to see if the consistency model is one of the first two
 						mp1_send(sockets[Leader], command, GlobalVariables["delay"], Name, Name, 0)
+					if int(c[-1]) == 2:
+						if c[0] == "get":
+							try:
+								print KeyValueStore[c[1]]
+							except KeyError:
+								print "Key does not exist"
+						else:
+							mp1_send(sockets[Leader], command, GlobalVariables["delay"], Name, Name, 0)
+					if int(c[-1]) == 3:
+						for i in range(4):
+							mp1_send(sockets["s"+str(i+1)], command, GlobalVariables["delay"], Name, Name, GlobalVariables["Sequencer_S"])
+						TO_Holdback[GlobalVariables["Sequencer_S"]] = 1
+						GlobalVariables["Sequencer_S"] += 1
+					if int(c[-1]) == 4:
+						for i in range(4):
+							mp1_send(sockets["s"+str(i+1)], command, GlobalVariables["delay"], Name, Name, GlobalVariables["Sequencer_S"])
+						TO_Holdback[GlobalVariables["Sequencer_S"]] = 2
+						GlobalVariables["Sequencer_S"] += 1
 				else:
 					for i in range(4):
 						mp1_send(sockets["s"+str(i+1)], command, GlobalVariables["delay"], Name, Name, -1)
@@ -167,28 +198,38 @@ def deliverHandler(sender):
 			pass
 
 def modelHandler(mesg_object):
-	c = mesg_object.message.split()
-	if c[0] == "delete":
-		del KeyValueStore[c[1]]
-	elif c[0] in ["get", "insert", "update"]:
-		if int(c[-1]) in [1, 2]:
-			#Total ordering necessary, need to know if leader
-			if mesg_object.seq == 0:
-				mesg_object.seq = GlobalVariables["Sequencer_S"]
-				GlobalVariables["Sequencer_S"] += 1
-				for i in range(4):
-					mp1_send(sockets["s"+str(i+1)], mesg_object.message, GlobalVariables["delay"], Name, mesg_object.origin, mesg_object.seq)
-			else:
-				TO_Holdback[mesg_object.seq] = mesg_object
-				HoldbackSem.release()
-
+	try:
+		c = mesg_object.message.split()
+	except AttributeError:
+		EventualQueue.put(mesg_object)
 	else:
-		pass
-		#Do Nothing
+		if c[0] == "delete":
+			del KeyValueStore[c[1]]
+		if c[0] == "search":
+			if c[1] in KeyValueStore:
+				mp1_send(sockets[mesg_object.origin], "Result: "+c[1]+" is in server "+Name, GlobalVariables["delay"], Name, Name, -1)
+			else:
+				mp1_send(sockets[mesg_object.origin], "Result: "+c[1]+" is not in server "+Name, GlobalVariables["delay"], Name, Name, -1)
+		if c[0] == "Result:":
+			print mesg_object.message
+		elif c[0] in ["get", "insert", "update"]:
+			if int(c[-1]) in [1, 2]:
+				#Total ordering necessary, need to know if leader
+				if mesg_object.seq == 0:
+					mesg_object.seq = GlobalVariables["Sequencer_S"]
+					GlobalVariables["Sequencer_S"] += 1
+					for i in range(4):
+						mp1_send(sockets["s"+str(i+1)], mesg_object.message, GlobalVariables["delay"], Name, mesg_object.origin, mesg_object.seq)
+				else:
+					TO_Holdback[mesg_object.seq] = mesg_object
+					HoldbackSem.release()
+			else:
+				EventualQueue.put(mesg_object)
+		else:
+			EventualQueue.put(mesg_object)
 
 def commandHandler(model):
-	print type(model)
-	if model == 1:
+	if model in [1,2]:
 		while GlobalFlags["keep_delivering"]:
 			if GlobalVariables["Sequencer_R"] in TO_Holdback:
 				mesg = TO_Holdback[GlobalVariables["Sequencer_R"]]
@@ -204,12 +245,81 @@ def commandHandler(model):
 						print "ack"
 			else:
 				HoldbackSem.acquire()
-	if model == 2:
-		pass
+	if model in [3,4]:
+		repair = threading.Thread(target=repairHandler, args=())
+		repair.start()
+		waitingFor = {}
+		while GlobalFlags["keep_delivering"]:
+			mesg_object = EventualQueue.get()
+			if mesg_object == "exit":
+				continue
+			try:
+				c = mesg_object.message.split()
+			except AttributeError:
+				if mesg_object.message[0] == "repairing":
+					if mesg_object.seq in TO_Holdback:
+						TO_Holdback[mesg_object.seq] -= 1
+						if mesg_object.seq in waitingFor:
+							waitingFor[mesg_object.seq].append(mesg_object.message[1])
+						else:
+							waitingFor[mesg_object.seq] = [mesg_object.message[1]]
+						if TO_Holdback[mesg_object.seq] == 0:
+							del TO_Holdback[mesg_object.seq]
+							recent = (0,0.0)
+							for elements in waitingFor[mesg_object.seq]:
+								if elements[1] > recent[1]:
+									recent = elements
+							KeyValueStore[mesg_object.message[2]] = recent
+				else:
+					if mesg_object.seq in TO_Holdback:
+						TO_Holdback[mesg_object.seq] -= 1
+						if mesg_object.seq in waitingFor:
+							waitingFor[mesg_object.seq].append(mesg_object.message)
+						else:
+							waitingFor[mesg_object.seq] = [mesg_object.message]
+						if TO_Holdback[mesg_object.seq] == 0:
+							del TO_Holdback[mesg_object.seq]
+							recent = (0,0.0)
+							for elements in waitingFor[mesg_object.seq]:
+								if elements[1] > recent[1]:
+									recent = elements
+							print elements[0]
 
+			else:
+				if c[0] == "ack":
+					if mesg_object.seq in TO_Holdback:
+						TO_Holdback[mesg_object.seq] -= 1
+						if TO_Holdback[mesg_object.seq] == 0:
+							del TO_Holdback[mesg_object.seq]
+							print "ack"
+				if c[0] == "get":
+					if c[1] in KeyValueStore:
+						mp1_send(sockets[mesg_object.origin], KeyValueStore[c[1]], GlobalVariables["delay"], Name, Name, mesg_object.seq)
+				if c[0] == "repair":
+					if c[1] in KeyValueStore:
+						mp1_send(sockets[mesg_object.origin], ("repairing",KeyValueStore[c[1]], c[1]), GlobalVariables["delay"], Name, Name, mesg_object.seq)
+					else:
+						mp1_send(sockets[mesg_object.origin], ("repairing",(0,0.0), None), GlobalVariables["delay"], Name, Name, mesg_object.seq)
+				if c[0] in ["insert", "update"]:
+					KeyValueStore[c[1]] = (c[2], time.time())
+					mp1_send(sockets[mesg_object.origin], "ack", GlobalVariables["delay"], Name, Name, mesg_object.seq)
+		repair.join()	
+					
 
-
+def repairHandler():
+	while GlobalFlags["keep_delivering"]:
+		time.sleep(20)
+		for key in KeyValueStore:
+			for i in range(4):
+				mp1_send(sockets["s"+str(i+1)], "repair "+key+" 3", GlobalVariables["delay"], Name, Name, "r"+str(GlobalVariables["Sequencer_R"]))
+			TO_Holdback["r"+str(GlobalVariables["Sequencer_R"])] = 4
+			GlobalVariables["Sequencer_R"] += 1
 
 
 if __name__ == "__main__":
 	main(sys.argv)
+
+
+
+
+
